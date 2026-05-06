@@ -30,6 +30,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	cephcsi "github.com/ceph/ceph-csi/api/deploy/kubernetes"
 	"github.com/ceph/ceph-csi/internal/cephfs/core"
 	cerrors "github.com/ceph/ceph-csi/internal/cephfs/errors"
 	"github.com/ceph/ceph-csi/internal/cephfs/store"
@@ -272,18 +273,25 @@ func buildCreateVolumeResponse(
 	volumeContext := util.GetVolumeContext(req.GetParameters())
 	volumeContext["subvolumeName"] = vID.FsSubvolName
 	volumeContext["subvolumePath"] = volOptions.RootPath
+	// For v1 SC format replace the clusterIDs YAML blob with flat per-cluster fields.
+	delete(volumeContext, util.ClusterIDsKey)
+	if volOptions.ProvisionerSecretRef.Name != "" {
+		volumeContext["clusterID"] = volOptions.ClusterID
+		volumeContext["csi.storage.k8s.io/provisioner-secret-name"] = volOptions.ProvisionerSecretRef.Name
+		volumeContext["csi.storage.k8s.io/provisioner-secret-namespace"] = volOptions.ProvisionerSecretRef.Namespace
+	}
 	volume := &csi.Volume{
 		VolumeId:      vID.VolumeID,
 		CapacityBytes: volOptions.Size,
 		ContentSource: req.GetVolumeContentSource(),
 		VolumeContext: volumeContext,
 	}
-	if volOptions.Topology != nil {
-		volume.AccessibleTopology = []*csi.Topology{
-			{
-				Segments: volOptions.Topology,
-			},
+	if len(volOptions.AccessibleTopologies) > 0 {
+		for _, zone := range volOptions.AccessibleTopologies {
+			volume.AccessibleTopology = append(volume.AccessibleTopology, &csi.Topology{Segments: zone})
 		}
+	} else if volOptions.Topology != nil {
+		volume.AccessibleTopology = []*csi.Topology{{Segments: volOptions.Topology}}
 	}
 
 	return &csi.CreateVolumeResponse{Volume: volume}
@@ -400,7 +408,7 @@ func (cs *ControllerServer) CreateVolume(
 						return nil, status.Error(codes.Internal, purgeErr.Error())
 					}
 				}
-				errUndo := store.UndoVolReservation(ctx, volOptions, *vID, secret)
+				errUndo := store.UndoVolReservation(ctx, volOptions, *vID, cr)
 				if errUndo != nil {
 					log.WarningLog(ctx, "failed undoing reservation of volume: %s (%s)",
 						requestName, errUndo)
@@ -423,7 +431,7 @@ func (cs *ControllerServer) CreateVolume(
 	}
 
 	// Reservation
-	vID, err = store.ReserveVol(ctx, volOptions, secret)
+	vID, err = store.ReserveVol(ctx, volOptions, cr)
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
@@ -431,7 +439,7 @@ func (cs *ControllerServer) CreateVolume(
 	defer func() {
 		if err != nil {
 			if !cerrors.IsCloneRetryError(err) {
-				errDefer := store.UndoVolReservation(ctx, volOptions, *vID, secret)
+				errDefer := store.UndoVolReservation(ctx, volOptions, *vID, cr)
 				if errDefer != nil {
 					log.WarningLog(ctx, "failed undoing reservation of volume: %s (%s)",
 						requestName, errDefer)
@@ -494,6 +502,56 @@ func (cs *ControllerServer) CreateVolume(
 		vID.FsSubvolName, requestName)
 
 	return buildCreateVolumeResponse(req, volOptions, vID), nil
+}
+
+// resolveAdminCredentials derives admin credentials for controller operations.
+// For the v1 SC format, req.GetSecrets() is empty because there is no top-level
+// csi.storage.k8s.io/provisioner-secret-name on the StorageClass. In that case
+// volOptions.ProvisionerSecretRef (resolved during NewVolumeOptionsFromVolID via
+// PV lookup) is used to fetch the per-cluster secret directly from Kubernetes.
+func resolveAdminCredentials(
+	volOptions *store.VolumeOptions,
+	secrets map[string]string,
+) (*util.Credentials, error) {
+	effective := secrets
+	if len(effective) == 0 && volOptions.ProvisionerSecretRef.Name != "" {
+		var sErr error
+		effective, sErr = k8s.GetSecret(
+			volOptions.ProvisionerSecretRef.Name,
+			volOptions.ProvisionerSecretRef.Namespace,
+		)
+		if sErr != nil {
+			return nil, fmt.Errorf("failed to get provisioner secret %q/%q: %w",
+				volOptions.ProvisionerSecretRef.Namespace,
+				volOptions.ProvisionerSecretRef.Name, sErr)
+		}
+	}
+	return util.NewAdminCredentials(util.FilterSecretsForCluster(effective, volOptions.ClusterID))
+}
+
+// resolveCredentialsForSnapshot resolves admin credentials for snapshot operations.
+// For the v1 VSC format where req.GetSecrets() is empty, it decodes the clusterID from
+// snapshotID and searches for the snapshotter secret in VolumeSnapshotClasses.
+func resolveCredentialsForSnapshot(driverName, snapshotID string, secrets map[string]string) (*util.Credentials, error) {
+	if len(secrets) > 0 {
+		return util.NewAdminCredentials(secrets)
+	}
+	var vi util.CSIIdentifier
+	if err := vi.DecomposeCSIID(snapshotID); err != nil {
+		return util.NewAdminCredentials(secrets) // will surface "provided secret is empty"
+	}
+	ref, refErr := k8s.GetSnapshotterSecretRefFromVolumeSnapshotClasses(
+		driverName, vi.ClusterID, util.GetSnapshotterSecretRefForCluster,
+	)
+	if refErr != nil || ref == nil {
+		return util.NewAdminCredentials(secrets)
+	}
+	snapSecrets, sErr := k8s.GetSecret(ref.Name, ref.Namespace)
+	if sErr != nil {
+		return nil, fmt.Errorf("failed to get snapshotter secret %q/%q: %w",
+			ref.Namespace, ref.Name, sErr)
+	}
+	return util.NewAdminCredentials(util.FilterSecretsForCluster(snapSecrets, vi.ClusterID))
 }
 
 // DeleteVolume deletes the volume in backend and its reservation.
@@ -559,7 +617,13 @@ func (cs *ControllerServer) DeleteVolume(
 		}
 		defer cs.VolumeLocks.Release(volOptions.RequestName)
 
-		if err = store.UndoVolReservation(ctx, volOptions, *vID, secrets); err != nil {
+		crUndo, crErr := resolveAdminCredentials(volOptions, secrets)
+		if crErr != nil {
+			return nil, status.Error(codes.Internal, crErr.Error())
+		}
+		defer crUndo.DeleteCredentials()
+
+		if err = store.UndoVolReservation(ctx, volOptions, *vID, crUndo); err != nil {
 			return nil, status.Error(codes.Internal, err.Error())
 		}
 
@@ -574,8 +638,10 @@ func (cs *ControllerServer) DeleteVolume(
 	}
 	defer cs.VolumeLocks.Release(volOptions.RequestName)
 
-	// Deleting a volume requires admin credentials
-	cr, err := util.NewAdminCredentials(secrets)
+	// Deleting a volume requires admin credentials. For the v1 SC format the
+	// provisioner secret is embedded in clusterIDs and resolveAdminCredentials
+	// fetches it from the ProvisionerSecretRef resolved during PV lookup.
+	cr, err := resolveAdminCredentials(volOptions, secrets)
 	if err != nil {
 		log.ErrorLog(ctx, "failed to retrieve admin credentials: %v", err)
 
@@ -587,7 +653,7 @@ func (cs *ControllerServer) DeleteVolume(
 		return nil, err
 	}
 
-	if err := store.UndoVolReservation(ctx, volOptions, *vID, secrets); err != nil {
+	if err := store.UndoVolReservation(ctx, volOptions, *vID, cr); err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 
@@ -824,15 +890,19 @@ func (cs *ControllerServer) CreateSnapshot(
 	if err := cs.validateSnapshotReq(ctx, req); err != nil {
 		return nil, err
 	}
-	cr, err := util.NewAdminCredentials(req.GetSecrets())
-	if err != nil {
-		return nil, err
-	}
-	defer cr.DeleteCredentials()
 
-	clusterData, err := store.GetClusterInformation(req.GetParameters(), nil)
-	if err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
+	// Detect v1 VolumeSnapshotClass format (clusterIDs list instead of single clusterID).
+	// In v1 mode the clusterID is derived from the source volume's volumeHandle, so
+	// GetClusterInformation (which reads the single "clusterID" key) is skipped.
+	_, isV1VSC := req.GetParameters()[util.ClusterIDsKey]
+
+	var clusterData *cephcsi.ClusterInfo
+	if !isV1VSC {
+		var ciErr error
+		clusterData, ciErr = store.GetClusterInformation(req.GetParameters(), nil)
+		if ciErr != nil {
+			return nil, status.Error(codes.Internal, ciErr.Error())
+		}
 	}
 
 	requestName := req.GetName()
@@ -845,7 +915,7 @@ func (cs *ControllerServer) CreateSnapshot(
 	}
 	defer cs.SnapshotLocks.Release(requestName)
 
-	if err = cs.OperationLocks.GetSnapshotCreateLock(sourceVolID); err != nil {
+	if err := cs.OperationLocks.GetSnapshotCreateLock(sourceVolID); err != nil {
 		log.ErrorLog(ctx, err.Error())
 
 		return nil, status.Error(codes.Aborted, err.Error())
@@ -853,9 +923,25 @@ func (cs *ControllerServer) CreateSnapshot(
 
 	defer cs.OperationLocks.ReleaseSnapshotCreateLock(sourceVolID)
 
+	// For the v1 format (SC or VSC) req.GetSecrets() is empty, but req.GetParameters()
+	// contains the clusterIDs with embedded secrets — resolve directly without a PV lookup.
+	// VSC v1: use snapshotter secret (falls back to provisioner secret if not set).
+	// SC v1:  use provisioner secret (existing behaviour, kept for CreateVolume callers).
+	snapSecrets := req.GetSecrets()
+	if len(snapSecrets) == 0 {
+		var vi util.CSIIdentifier
+		if decompErr := vi.DecomposeCSIID(sourceVolID); decompErr == nil {
+			if ref, isV1, refErr := util.GetSnapshotterSecretRefForCluster(req.GetParameters(), vi.ClusterID); refErr == nil && isV1 && ref != nil {
+				if resolved, sErr := k8s.GetSecret(ref.Name, ref.Namespace); sErr == nil {
+					snapSecrets = resolved
+				}
+			}
+		}
+	}
+
 	// Find the volume using the provided VolumeID
 	parentVolOptions, vid, err := store.NewVolumeOptionsFromVolID(ctx,
-		sourceVolID, nil, req.GetSecrets(), cs.ClusterName, cs.SetMetadata)
+		sourceVolID, nil, snapSecrets, cs.ClusterName, cs.SetMetadata)
 	if err != nil {
 		if errors.Is(err, util.ErrPoolNotFound) {
 			log.WarningLog(ctx, "failed to get backend volume for %s: %v", sourceVolID, err)
@@ -871,7 +957,15 @@ func (cs *ControllerServer) CreateSnapshot(
 	}
 	defer parentVolOptions.Destroy()
 
-	if clusterData.ClusterID != parentVolOptions.ClusterID {
+	cr, err := resolveAdminCredentials(parentVolOptions, snapSecrets)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	defer cr.DeleteCredentials()
+
+	// Legacy VSC: validate that the VSC clusterID matches the source volume's clusterID.
+	// v1 VSC: skip — the clusterID is derived from the source volume itself.
+	if !isV1VSC && clusterData.ClusterID != parentVolOptions.ClusterID {
 		return nil, status.Errorf(
 			codes.InvalidArgument,
 			"requested cluster id %s not matching subvolume cluster id %s",
@@ -883,7 +977,13 @@ func (cs *ControllerServer) CreateSnapshot(
 		return nil, status.Error(codes.InvalidArgument, "cannot snapshot a snapshot-backed volume")
 	}
 
-	cephfsSnap, genSnapErr := store.GenSnapFromOptions(ctx, req)
+	// v1 VSC: pass the source volume's clusterID so GenSnapFromOptions can look up
+	// monitors without requiring a "clusterID" key in the VSC parameters.
+	overrideClusterID := ""
+	if isV1VSC {
+		overrideClusterID = parentVolOptions.ClusterID
+	}
+	cephfsSnap, genSnapErr := store.GenSnapFromOptions(ctx, req, overrideClusterID)
 	if genSnapErr != nil {
 		return nil, status.Error(codes.Internal, genSnapErr.Error())
 	}
@@ -1054,15 +1154,18 @@ func (cs *ControllerServer) DeleteSnapshot(
 		return nil, err
 	}
 
-	cr, err := util.NewAdminCredentials(req.GetSecrets())
-	if err != nil {
-		return nil, status.Error(codes.InvalidArgument, err.Error())
-	}
-	defer cr.DeleteCredentials()
 	snapshotID := req.GetSnapshotId()
 	if snapshotID == "" {
 		return nil, status.Error(codes.InvalidArgument, "snapshot ID cannot be empty")
 	}
+
+	// For the v1 SC format, req.GetSecrets() is empty. Resolve credentials by
+	// decoding the clusterID from snapshotID and finding the provisioner secret
+	cr, err := resolveCredentialsForSnapshot(cs.Driver.GetName(), snapshotID, req.GetSecrets())
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	defer cr.DeleteCredentials()
 
 	if acquired := cs.SnapshotLocks.TryAcquire(snapshotID); !acquired {
 		log.ErrorLog(ctx, util.SnapshotOperationAlreadyExistsFmt, snapshotID)

@@ -65,8 +65,18 @@ func ValidateNodeStageVolumeRequest(req *csi.NodeStageVolumeRequest) error {
 		return status.Error(codes.InvalidArgument, "staging target path missing in request")
 	}
 
-	if req.GetSecrets() == nil || len(req.GetSecrets()) == 0 {
-		return status.Error(codes.InvalidArgument, "stage secrets cannot be nil or empty")
+	// For the v1 clusterIDs SC format the node-stage secret is embedded inside
+	// the clusterIDs volume context parameter and resolved by the driver
+	// internally. Skip the secrets check when clusterIDs is present (legacy v1
+	// format) or when provisioner-secret-name is present (flat v1 format where
+	// clusterIDs was removed from volumeAttributes after provisioning).
+	volCtx := req.GetVolumeContext()
+	_, hasClusterIDs := volCtx[ClusterIDsKey]
+	_, hasProvisionerSecret := volCtx["csi.storage.k8s.io/provisioner-secret-name"]
+	if !hasClusterIDs && !hasProvisionerSecret {
+		if req.GetSecrets() == nil || len(req.GetSecrets()) == 0 {
+			return status.Error(codes.InvalidArgument, "stage secrets cannot be nil or empty")
+		}
 	}
 
 	// validate stagingpath exists

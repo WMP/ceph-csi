@@ -63,9 +63,14 @@ type VolumeOptions struct {
 	TopologyPools        *[]util.TopologyConstrainedPool
 	TopologyRequirement  *csi.TopologyRequirement
 	Topology             map[string]string
+	// AccessibleTopologies holds all topology zones from the matched v1 SC entry.
+	AccessibleTopologies []map[string]string
 	// ProvisionerSecretRef holds the resolved provisioner secret reference from
 	// the v1 SC format entry. Empty for legacy single-clusterID deployments.
 	ProvisionerSecretRef corev1.SecretReference
+	// NodeStageSecretRef holds the resolved node-stage secret reference from
+	// the v1 SC format entry. Empty for legacy single-clusterID deployments.
+	NodeStageSecretRef corev1.SecretReference
 	FscID                int64
 
 	// Encryption provides access to optional VolumeEncryption functions
@@ -192,10 +197,9 @@ func GetClusterInformation(
 	options map[string]string,
 	topologyReq *csi.TopologyRequirement,
 ) (*cephcsi.ClusterInfo, error) {
-	var matchedTopology map[string]string
-
 	clusterID, ok := options["clusterID"]
 	if !ok || clusterID == "" {
+		// v1 SC format — ClusterInfo fully built from SC entry, only monitors from ConfigMap
 		ci, isV1, err := util.GetClusterInfoByTopologyV1(options, topologyReq)
 		if err != nil {
 			return nil, err
@@ -218,18 +222,10 @@ func GetClusterInformation(
 					return nil, fmt.Errorf("failed to fetch subvolumegroup using clusterID (%s): %w", ci.ClusterID, mErr)
 				}
 			}
-
 			return ci, nil
 		}
 
-		// Fallback: try topology-based cluster selection.
-		// GetClusterIDAndTopologyByTopology returns the topology labels directly
-		// from the matched config entry, which is correct even when the same
-		// clusterID appears multiple times with different topology labels.
-		clusterID, matchedTopology, err = util.GetClusterIDAndTopologyByTopology(options, util.CsiConfigFile, topologyReq)
-		if err != nil {
-			return nil, errors.New("clusterID must be set or clusterIDs with topology requirements must be provided")
-		}
+		return nil, errors.New("clusterID must be set or clusterIDs in v1 YAML format must be provided")
 	}
 
 	monitors, err := util.Mons(util.CsiConfigFile, clusterID)
@@ -253,9 +249,8 @@ func GetClusterInformation(
 		return nil, err
 	}
 	clusterData := &cephcsi.ClusterInfo{
-		ClusterID:            clusterID,
-		Monitors:             strings.Split(monitors, ","),
-		TopologyDomainLabels: matchedTopology,
+		ClusterID: clusterID,
+		Monitors:  strings.Split(monitors, ","),
 	}
 	clusterData.CephFS.SubvolumeGroup = subvolumeGroup
 	clusterData.CephFS.RadosNamespace = radosNamespace
@@ -291,6 +286,7 @@ func getVolumeOptions(vo map[string]string, topologyReq *csi.TopologyRequirement
 	opts.SubvolumeGroup = clusterData.CephFS.SubvolumeGroup
 	opts.RadosNamespace = clusterData.CephFS.RadosNamespace
 	opts.Topology = clusterData.TopologyDomainLabels
+	opts.AccessibleTopologies = clusterData.AllTopologyZones
 	opts.ProvisionerSecretRef = clusterData.CephFS.ProvisionerSecretRef
 
 	if clusterData.CephFS.FsName != "" {
@@ -330,10 +326,8 @@ func NewVolumeOptions(
 	opts.Owner = k8s.GetOwner(volOptions)
 	opts.BackingSnapshot = IsShallowVolumeSupported(req)
 
-	if opts.Pool == "" {
-		if err = extractOptionalOption(&opts.Pool, "pool", volOptions); err != nil {
-			return nil, err
-		}
+	if err = extractOptionalOption(&opts.Pool, "pool", volOptions); err != nil {
+		return nil, err
 	}
 
 	if err = extractMounter(&opts.Mounter, volOptions); err != nil {
@@ -417,9 +411,8 @@ func NewVolumeOptions(
 
 // NewVolumeOptionsWithSecrets is like NewVolumeOptions but accepts raw secrets
 // instead of pre-built Credentials. It resolves the clusterID first, then
-// resolves per-cluster credentials from the request secret or a per-cluster
-// provisioner secret reference and returns the resulting Credentials alongside
-// VolumeOptions.
+// filters per-cluster credentials from the secret using FilterSecretsForCluster,
+// and returns the resulting Credentials alongside VolumeOptions.
 // Use this instead of NewVolumeOptions when topology-aware cluster selection
 // is needed (i.e. StorageClass uses clusterIDs instead of clusterID).
 func NewVolumeOptionsWithSecrets(
@@ -524,6 +517,60 @@ func NewVolumeOptionsFromVolID(
 
 	if volOptions.RadosNamespace, err = util.GetCephFSRadosNamespace(util.CsiConfigFile, vi.ClusterID); err != nil {
 		return nil, nil, fmt.Errorf("failed to fetch rados namespace using clusterID (%s): %w", vi.ClusterID, err)
+	}
+
+	// v1 SC format (controller path): volOpt is nil but the PV's volumeAttributes
+	// carry per-cluster secret info. Look up the PV to resolve credentials so
+	// DeleteVolume/ControllerExpand work without a top-level provisioner-secret in SC.
+	// Supports both new flat format and legacy clusterIDs YAML blob.
+	if volOpt == nil && len(secrets) == 0 {
+		if pvAttrs, pvErr := k8s.GetVolumeAttributesByVolumeHandle(volID); pvErr == nil && pvAttrs != nil {
+			// New flat format: secret written directly to PV volumeAttributes.
+			if secretName := pvAttrs["csi.storage.k8s.io/provisioner-secret-name"]; secretName != "" {
+				secretNS := pvAttrs["csi.storage.k8s.io/provisioner-secret-namespace"]
+				if provSecrets, sErr := k8s.GetSecret(secretName, secretNS); sErr == nil {
+					secrets = provSecrets
+					volOptions.ProvisionerSecretRef = corev1.SecretReference{Name: secretName, Namespace: secretNS}
+				}
+			} else if ref, isV1, refErr := util.GetProvisionerSecretRefForCluster(pvAttrs, vi.ClusterID); refErr == nil && isV1 && ref != nil {
+				// Legacy format: clusterIDs YAML blob in volumeAttributes.
+				if provSecrets, sErr := k8s.GetSecret(ref.Name, ref.Namespace); sErr == nil {
+					secrets = provSecrets
+					volOptions.ProvisionerSecretRef = *ref
+				}
+			}
+		}
+		// silently fall through on any lookup error — NewAdminCredentials below
+		// will surface the failure with a clear message, preserving existing
+		// behavior for non-v1 formats and old-style deployments.
+	}
+
+	// v1 SC format: node-stage-secret-name is embedded inside the clusterIDs
+	// string and Kubernetes does not pass it automatically. Fetch it directly.
+	if ref, isV1, refErr := util.GetNodeStageSecretRefForCluster(volOpt, vi.ClusterID); refErr != nil {
+		return nil, nil, fmt.Errorf("failed to resolve node-stage secret for cluster %q: %w", vi.ClusterID, refErr)
+	} else if isV1 && ref != nil {
+		nodeSecrets, sErr := k8s.GetSecret(ref.Name, ref.Namespace)
+		if sErr != nil {
+			return nil, nil, fmt.Errorf("failed to get node-stage secret %q/%q for cluster %q: %w",
+				ref.Namespace, ref.Name, vi.ClusterID, sErr)
+		}
+		secrets = nodeSecrets
+		volOptions.NodeStageSecretRef = *ref
+	} else if volOptions.NodeStageSecretRef.Name == "" {
+		// Flat format PVs (v1 SC format after provisioning) store only
+		// provisioner-secret-name in volumeAttributes. In this format the
+		// provisioner and node-stage secret are the same, so reuse it.
+		if secretName := volOpt["csi.storage.k8s.io/provisioner-secret-name"]; secretName != "" {
+			secretNS := volOpt["csi.storage.k8s.io/provisioner-secret-namespace"]
+			flatSecrets, sErr := k8s.GetSecret(secretName, secretNS)
+			if sErr != nil {
+				return nil, nil, fmt.Errorf("failed to get node-stage secret %q/%q for cluster %q: %w",
+					secretNS, secretName, vi.ClusterID, sErr)
+			}
+			secrets = flatSecrets
+			volOptions.NodeStageSecretRef = corev1.SecretReference{Name: secretName, Namespace: secretNS}
+		}
 	}
 
 	cr, err := util.NewAdminCredentials(util.FilterSecretsForCluster(secrets, vi.ClusterID))
@@ -1018,15 +1065,24 @@ type SnapshotOption struct {
 	NamePrefix  string // Name prefix of the snapshot.
 }
 
-func GenSnapFromOptions(ctx context.Context, req *csi.CreateSnapshotRequest) (*SnapshotOption, error) {
+// GenSnapFromOptions creates a SnapshotOption from the CreateSnapshotRequest parameters.
+// overrideClusterID is used in v1 VolumeSnapshotClass format where the clusterID is
+// determined from the source volume's volumeHandle rather than the VSC parameters.
+// Pass an empty string to use the clusterID from VSC parameters (legacy format).
+func GenSnapFromOptions(ctx context.Context, req *csi.CreateSnapshotRequest, overrideClusterID string) (*SnapshotOption, error) {
 	cephfsSnap := &SnapshotOption{}
 	cephfsSnap.RequestName = req.GetName()
 	snapOptions := req.GetParameters()
 
-	clusterID, err := util.GetClusterID(snapOptions)
-	if err != nil {
-		return nil, err
+	clusterID := overrideClusterID
+	if clusterID == "" {
+		var err error
+		clusterID, err = util.GetClusterID(snapOptions)
+		if err != nil {
+			return nil, err
+		}
 	}
+	var err error
 	cephfsSnap.Monitors, cephfsSnap.ClusterID, err = util.GetMonsAndClusterID(ctx, clusterID, false)
 	if err != nil {
 		log.ErrorLog(ctx, "failed getting mons (%s)", err)

@@ -304,12 +304,10 @@ func parseV1ClusterIDs(s string) ([]kubernetes.SCClusterEntry, bool, error) {
 	if !strings.HasPrefix(s, "-") && !strings.HasPrefix(s, "[") {
 		return nil, false, nil
 	}
-
 	var entries []kubernetes.SCClusterEntry
 	if err := sigyaml.Unmarshal([]byte(s), &entries); err != nil {
 		return nil, false, fmt.Errorf("clusterIDs looks like a list but failed to parse as v1 format: %w", err)
 	}
-
 	return entries, true, nil
 }
 
@@ -320,57 +318,65 @@ func buildClusterInfoFromSCEntry(entry kubernetes.SCClusterEntry, zone map[strin
 	ci := kubernetes.ClusterInfo{
 		ClusterID:            entry.ClusterID,
 		TopologyDomainLabels: zone,
+		AllTopologyZones:     entry.TopologyDomainLabels,
 		CephFS: kubernetes.CephFS{
 			FsName: entry.FsName,
 			Pool:   entry.Pool,
 		},
+		RBD: kubernetes.RBD{
+			Pool:     entry.Pool,
+			DataPool: entry.DataPool,
+		},
 	}
-
 	if entry.ProvisionerSecretName != "" {
-		ci.CephFS.ProvisionerSecretRef = corev1.SecretReference{
+		ref := corev1.SecretReference{
 			Name:      entry.ProvisionerSecretName,
 			Namespace: entry.ProvisionerSecretNamespace,
 		}
+		ci.CephFS.ProvisionerSecretRef = ref
+		ci.RBD.ProvisionerSecretRef = ref
 	}
 	if entry.NodeStageSecretName != "" {
-		ci.CephFS.NodeStageSecretRef = corev1.SecretReference{
+		ref := corev1.SecretReference{
 			Name:      entry.NodeStageSecretName,
 			Namespace: entry.NodeStageSecretNamespace,
 		}
+		ci.CephFS.NodeStageSecretRef = ref
+		ci.RBD.NodeStageSecretRef = ref
 	}
 	if entry.ControllerExpandSecretName != "" {
-		ci.CephFS.ControllerExpandSecretRef = corev1.SecretReference{
+		ref := corev1.SecretReference{
 			Name:      entry.ControllerExpandSecretName,
 			Namespace: entry.ControllerExpandSecretNamespace,
 		}
+		ci.CephFS.ControllerExpandSecretRef = ref
+		ci.RBD.ControllerExpandSecretRef = ref
 	}
-
 	return ci
 }
 
 // expandSCEntriesToClusterInfos converts []SCClusterEntry to []ClusterInfo.
 // Each entry's topologyDomainLabels list is expanded into separate ClusterInfo
 // entries (one per zone), because matchClusterTopology operates on a single
-// map[string]string.
+// map[string]string. "Cluster X serves zones B,C,S" → three candidate entries.
 func expandSCEntriesToClusterInfos(entries []kubernetes.SCClusterEntry) []kubernetes.ClusterInfo {
 	var result []kubernetes.ClusterInfo
-
 	for _, entry := range entries {
 		if len(entry.TopologyDomainLabels) == 0 {
 			result = append(result, buildClusterInfoFromSCEntry(entry, nil))
-			continue
-		}
-		for _, zone := range entry.TopologyDomainLabels {
-			result = append(result, buildClusterInfoFromSCEntry(entry, zone))
+		} else {
+			for _, zone := range entry.TopologyDomainLabels {
+				result = append(result, buildClusterInfoFromSCEntry(entry, zone))
+			}
 		}
 	}
-
 	return result
 }
 
 // GetClusterInfoByTopologyV1 checks if the clusterIDs option is in v1 YAML/JSON
 // format and if so resolves the matching ClusterInfo directly from the SC entry.
-// Returns (nil, false, nil) when clusterIDs is not v1 format.
+// Returns (nil, false, nil) when clusterIDs is not v1 format — caller falls back
+// to the legacy comma-separated path. Returns (nil, false, err) on any error.
 func GetClusterInfoByTopologyV1(
 	options map[string]string,
 	topologyReq *csi.TopologyRequirement,
@@ -402,6 +408,10 @@ func GetClusterInfoByTopologyV1(
 				out.TopologyDomainLabels[k] = v
 			}
 		}
+		if len(ci.AllTopologyZones) > 0 {
+			out.AllTopologyZones = make([]map[string]string, len(ci.AllTopologyZones))
+			copy(out.AllTopologyZones, ci.AllTopologyZones)
+		}
 		return &out
 	}
 
@@ -425,17 +435,16 @@ func GetClusterInfoByTopologyV1(
 		topologyReq.GetPreferred(), topologyReq.GetRequisite())
 }
 
-// GetNodeStageSecretRefForCluster returns the NodeStageSecretRef for the given
-// clusterID from the v1 clusterIDs format in the options map.
-func GetNodeStageSecretRefForCluster(
-	options map[string]string,
-	clusterID string,
-) (*corev1.SecretReference, bool, error) {
+// GetProvisionerSecretRefForCluster returns the ProvisionerSecretRef for the
+// given clusterID from the v1 clusterIDs format in the options map.
+// Returns (nil, false, nil) when clusterIDs is absent or not v1 format — caller
+// falls back to the standard Kubernetes-provided secrets.
+// Returns (nil, false, err) on malformed v1 format.
+func GetProvisionerSecretRefForCluster(options map[string]string, clusterID string) (*corev1.SecretReference, bool, error) {
 	clusterIDsStr, ok := options[ClusterIDsKey]
 	if !ok || clusterIDsStr == "" {
 		return nil, false, nil
 	}
-
 	entries, isV1, err := parseV1ClusterIDs(clusterIDsStr)
 	if err != nil {
 		return nil, false, err
@@ -443,7 +452,76 @@ func GetNodeStageSecretRefForCluster(
 	if !isV1 {
 		return nil, false, nil
 	}
+	for _, entry := range entries {
+		if entry.ClusterID == clusterID && entry.ProvisionerSecretName != "" {
+			return &corev1.SecretReference{
+				Name:      entry.ProvisionerSecretName,
+				Namespace: entry.ProvisionerSecretNamespace,
+			}, true, nil
+		}
+	}
+	return nil, false, nil
+}
 
+// GetSnapshotterSecretRefForCluster returns the snapshotter SecretRef for the
+// given clusterID from the v1 clusterIDs format in the options map.
+// Used for VolumeSnapshotClass v1 format where secrets are embedded in clusterIDs.
+// Prefers SnapshotterSecretName/Namespace; falls back to ProvisionerSecretName/Namespace
+// when the snapshotter-specific fields are absent (same admin credentials).
+// Returns (nil, false, nil) when clusterIDs is absent or not v1 format — caller
+// falls back to the standard Kubernetes-provided secrets.
+// Returns (nil, false, err) on malformed v1 format.
+func GetSnapshotterSecretRefForCluster(options map[string]string, clusterID string) (*corev1.SecretReference, bool, error) {
+	clusterIDsStr, ok := options[ClusterIDsKey]
+	if !ok || clusterIDsStr == "" {
+		return nil, false, nil
+	}
+	entries, isV1, err := parseV1ClusterIDs(clusterIDsStr)
+	if err != nil {
+		return nil, false, err
+	}
+	if !isV1 {
+		return nil, false, nil
+	}
+	for _, entry := range entries {
+		if entry.ClusterID != clusterID {
+			continue
+		}
+		// prefer explicit snapshotter secret
+		if entry.SnapshotterSecretName != "" {
+			return &corev1.SecretReference{
+				Name:      entry.SnapshotterSecretName,
+				Namespace: entry.SnapshotterSecretNamespace,
+			}, true, nil
+		}
+		// fall back to provisioner secret (same admin credentials for Ceph)
+		if entry.ProvisionerSecretName != "" {
+			return &corev1.SecretReference{
+				Name:      entry.ProvisionerSecretName,
+				Namespace: entry.ProvisionerSecretNamespace,
+			}, true, nil
+		}
+	}
+	return nil, false, nil
+}
+
+// GetNodeStageSecretRefForCluster returns the NodeStageSecretRef for the given
+// clusterID from the v1 clusterIDs format in the options map.
+// Returns (nil, false, nil) when clusterIDs is absent or not v1 format — caller
+// falls back to the standard Kubernetes-provided secrets.
+// Returns (nil, false, err) on malformed v1 format.
+func GetNodeStageSecretRefForCluster(options map[string]string, clusterID string) (*corev1.SecretReference, bool, error) {
+	clusterIDsStr, ok := options[ClusterIDsKey]
+	if !ok || clusterIDsStr == "" {
+		return nil, false, nil
+	}
+	entries, isV1, err := parseV1ClusterIDs(clusterIDsStr)
+	if err != nil {
+		return nil, false, err
+	}
+	if !isV1 {
+		return nil, false, nil
+	}
 	for _, entry := range entries {
 		if entry.ClusterID == clusterID && entry.NodeStageSecretName != "" {
 			return &corev1.SecretReference{
@@ -452,58 +530,7 @@ func GetNodeStageSecretRefForCluster(
 			}, true, nil
 		}
 	}
-
 	return nil, false, nil
-}
-
-// GetControllerExpandSecretRefForCluster returns the ControllerExpandSecretRef
-// for the given clusterID from the v1 clusterIDs format in the options map.
-func GetControllerExpandSecretRefForCluster(
-	options map[string]string,
-	clusterID string,
-) (*corev1.SecretReference, bool, error) {
-	clusterIDsStr, ok := options[ClusterIDsKey]
-	if !ok || clusterIDsStr == "" {
-		return nil, false, nil
-	}
-
-	entries, isV1, err := parseV1ClusterIDs(clusterIDsStr)
-	if err != nil {
-		return nil, false, err
-	}
-	if !isV1 {
-		return nil, false, nil
-	}
-
-	for _, entry := range entries {
-		if entry.ClusterID == clusterID && entry.ControllerExpandSecretName != "" {
-			return &corev1.SecretReference{
-				Name:      entry.ControllerExpandSecretName,
-				Namespace: entry.ControllerExpandSecretNamespace,
-			}, true, nil
-		}
-	}
-
-	return nil, false, nil
-}
-
-// readAllClusterInfos reads and returns all cluster entries from the config file.
-func readAllClusterInfos(pathToConfig string) ([]kubernetes.ClusterInfo, error) {
-	var config []kubernetes.ClusterInfo
-
-	// #nosec
-	content, err := os.ReadFile(pathToConfig)
-	if err != nil {
-		return nil, fmt.Errorf("error reading CSI config file %q: %w", pathToConfig, err)
-	}
-
-	err = json.Unmarshal(content, &config)
-	if err != nil {
-		return nil, fmt.Errorf("unmarshal failed (%w), raw buffer response: %s",
-			err, string(content))
-	}
-
-	return config, nil
 }
 
 // matchClusterTopology checks if a cluster's TopologyDomainLabels match
@@ -524,109 +551,3 @@ func matchClusterTopology(cluster *kubernetes.ClusterInfo, segments map[string]s
 	return true
 }
 
-// FindClusterByTopology selects a cluster from the config file based on
-// topology requirements. It filters clusters by the given clusterIDs list
-// and matches their TopologyDomainLabels against the AccessibilityRequirements.
-// Preferred topologies are checked first, then requisite.
-//
-// Returns the matched clusterID and a copy of the matched entry's
-// TopologyDomainLabels. Because the same clusterID may appear multiple times
-// in the config with different TopologyDomainLabels, the topology is taken
-// directly from the matched entry rather than re-looked-up by clusterID.
-func FindClusterByTopology(
-	pathToConfig string,
-	clusterIDs []string,
-	topologyReq *csi.TopologyRequirement,
-) (string, map[string]string, error) {
-	if topologyReq == nil {
-		return "", nil, fmt.Errorf("topology requirements are nil, cannot select cluster")
-	}
-
-	allClusters, err := readAllClusterInfos(pathToConfig)
-	if err != nil {
-		return "", nil, err
-	}
-
-	// build a set of allowed clusterIDs for fast lookup
-	allowed := make(map[string]bool, len(clusterIDs))
-	for _, id := range clusterIDs {
-		allowed[strings.TrimSpace(id)] = true
-	}
-
-	// filter clusters to only those in the allowed list
-	var candidates []kubernetes.ClusterInfo
-	for i := range allClusters {
-		if allowed[allClusters[i].ClusterID] {
-			candidates = append(candidates, allClusters[i])
-		}
-	}
-
-	if len(candidates) == 0 {
-		return "", nil, fmt.Errorf("none of the cluster IDs %v found in CSI config %q", clusterIDs, pathToConfig)
-	}
-
-	copyTopology := func(labels map[string]string) map[string]string {
-		out := make(map[string]string, len(labels))
-		for k, v := range labels {
-			out[k] = v
-		}
-		return out
-	}
-
-	// check preferred topologies first
-	for _, topology := range topologyReq.GetPreferred() {
-		for i := range candidates {
-			if matchClusterTopology(&candidates[i], topology.GetSegments()) {
-				return candidates[i].ClusterID, copyTopology(candidates[i].TopologyDomainLabels), nil
-			}
-		}
-	}
-
-	// fall back to requisite topologies
-	for _, topology := range topologyReq.GetRequisite() {
-		for i := range candidates {
-			if matchClusterTopology(&candidates[i], topology.GetSegments()) {
-				return candidates[i].ClusterID, copyTopology(candidates[i].TopologyDomainLabels), nil
-			}
-		}
-	}
-
-	return "", nil, fmt.Errorf(
-		"no cluster from %v matches the topology requirements (preferred: %v, requisite: %v)",
-		clusterIDs, topologyReq.GetPreferred(), topologyReq.GetRequisite())
-}
-
-// GetClusterIDAndTopologyByTopology checks if the options contain a "clusterIDs"
-// parameter and resolves the appropriate clusterID and its topology domain labels
-// based on topology requirements. Returns ErrClusterIDNotSet if "clusterIDs" is
-// not present in the options.
-//
-// The returned topology map is copied directly from the matched config entry,
-// which is correct even when multiple entries share the same clusterID.
-func GetClusterIDAndTopologyByTopology(
-	options map[string]string,
-	pathToConfig string,
-	topologyReq *csi.TopologyRequirement,
-) (string, map[string]string, error) {
-	clusterIDsStr, ok := options[ClusterIDsKey]
-	if !ok || clusterIDsStr == "" {
-		return "", nil, ErrClusterIDNotSet
-	}
-
-	clusterIDs := strings.Split(clusterIDsStr, ",")
-
-	return FindClusterByTopology(pathToConfig, clusterIDs, topologyReq)
-}
-
-// GetClusterIDByTopology checks if the options contain a "clusterIDs" parameter
-// and resolves the appropriate clusterID based on topology requirements.
-// Returns ErrClusterIDNotSet if "clusterIDs" is not present in the options.
-func GetClusterIDByTopology(
-	options map[string]string,
-	pathToConfig string,
-	topologyReq *csi.TopologyRequirement,
-) (string, error) {
-	clusterID, _, err := GetClusterIDAndTopologyByTopology(options, pathToConfig, topologyReq)
-
-	return clusterID, err
-}

@@ -45,6 +45,12 @@ type CSIDriver struct {
 	vc                []*csi.VolumeCapability_AccessMode
 }
 
+// HasTopology returns true when the driver was started with --domainlabels,
+// meaning topology-aware provisioning is active.
+func (d *CSIDriver) HasTopology() bool {
+	return len(d.topology) > 0
+}
+
 // NewCSIDriver Creates a NewCSIDriver object. Assumes vendor
 // version is equal to driver version &  does not support optional
 // driver plugin info manifest field. Refer to CSI spec for more details.
@@ -82,6 +88,11 @@ func NewCSIDriver(name, v, nodeID, instance string, enableFencing bool) *CSIDriv
 	}
 
 	return &driver
+}
+
+// GetName returns the name of the CSI driver.
+func (d *CSIDriver) GetName() string {
+	return d.name
 }
 
 // GetInstance returns the instance identification of the CSI driver.
@@ -160,6 +171,12 @@ func (d *CSIDriver) AddGroupControllerServiceCapabilities(cl []csi.GroupControll
 	}
 
 	d.groupCapabilities = csc
+}
+
+// SetTopology sets the topology map on the driver (used by controller servers
+// that need to advertise VOLUME_ACCESSIBILITY_CONSTRAINTS).
+func (d *CSIDriver) SetTopology(topology map[string]string) {
+	d.topology = topology
 }
 
 // ValidateGroupControllerServiceRequest validates the group controller

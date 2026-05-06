@@ -33,6 +33,7 @@ import (
 	librbd "github.com/ceph/go-ceph/rbd"
 	"github.com/ceph/go-ceph/rbd/admin"
 	"github.com/container-storage-interface/spec/lib/go/csi"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/cloud-provider/volume/helpers"
 	mount "k8s.io/mount-utils"
@@ -199,6 +200,11 @@ type rbdVolume struct {
 	RequestedVolSize   int64
 	DisableInUseChecks bool
 	readOnly           bool
+	// ProvisionerSecretRef holds the resolved provisioner secret from v1 SC format.
+	ProvisionerSecretRef corev1.SecretReference
+	// AccessibleTopologies holds all topology zones from the matched v1 SC entry,
+	// so CreateVolume can set the full AccessibleTopology list on the PV.
+	AccessibleTopologies []map[string]string
 }
 
 // rbdSnapshot represents a CSI snapshot and its RBD snapshot specifics.
@@ -1384,41 +1390,61 @@ func genVolFromVolumeOptions(
 
 	rbdVol := &rbdVolume{}
 
-	rbdVol.Pool, ok = volOptions["pool"]
-	if !ok {
-		if _, ok = volOptions["topologyConstrainedPools"]; !ok {
-			return nil, errors.New("empty pool name or topologyConstrainedPools to provision volume")
-		}
+	// v1 SC format: clusterIDs is a YAML/JSON list with per-cluster secrets, pool, and topology.
+	v1Info, isV1, err := util.GetClusterInfoByTopologyV1(volOptions, topologyReq)
+	if err != nil {
+		return nil, err
 	}
 
-	rbdVol.DataPool = volOptions["dataPool"]
 	if namePrefix, ok = volOptions["volumeNamePrefix"]; ok {
 		rbdVol.NamePrefix = namePrefix
 	}
 
-	clusterID, err := util.GetClusterID(volOptions)
-	if err != nil {
-		// Fallback: try topology-based cluster selection.
-		// GetClusterIDAndTopologyByTopology returns the topology labels directly
-		// from the matched config entry, which is correct even when the same
-		// clusterID appears multiple times with different topology labels.
-		var matchedTopology map[string]string
-		clusterID, matchedTopology, err = util.GetClusterIDAndTopologyByTopology(volOptions, util.CsiConfigFile, topologyReq)
+	if isV1 {
+		rbdVol.Pool = v1Info.RBD.Pool
+		rbdVol.DataPool = v1Info.RBD.DataPool
+		rbdVol.Topology = v1Info.TopologyDomainLabels
+		if rbdVol.Pool == "" {
+			if _, ok = volOptions["topologyConstrainedPools"]; !ok {
+				return nil, errors.New("empty pool name or topologyConstrainedPools to provision volume")
+			}
+		}
+		rbdVol.Monitors, err = util.Mons(util.CsiConfigFile, v1Info.ClusterID)
+		if err != nil {
+			log.ErrorLog(ctx, "failed getting mons for cluster %s: %s", v1Info.ClusterID, err)
+
+			return nil, err
+		}
+		rbdVol.ClusterID = v1Info.ClusterID
+		rbdVol.ProvisionerSecretRef = v1Info.RBD.ProvisionerSecretRef
+		rbdVol.AccessibleTopologies = v1Info.AllTopologyZones
+		rbdVol.RadosNamespace, err = util.GetRBDRadosNamespace(util.CsiConfigFile, rbdVol.ClusterID)
 		if err != nil {
 			return nil, err
 		}
-		rbdVol.Topology = matchedTopology
-	}
-	rbdVol.Monitors, rbdVol.ClusterID, err = util.GetMonsAndClusterID(ctx, clusterID, checkClusterIDMapping)
-	if err != nil {
-		log.ErrorLog(ctx, "failed getting mons (%s)", err)
+	} else {
+		rbdVol.Pool, ok = volOptions["pool"]
+		if !ok {
+			if _, ok = volOptions["topologyConstrainedPools"]; !ok {
+				return nil, errors.New("empty pool name or topologyConstrainedPools to provision volume")
+			}
+		}
+		rbdVol.DataPool = volOptions["dataPool"]
 
-		return nil, err
-	}
+		clusterID, cErr := util.GetClusterID(volOptions)
+		if cErr != nil {
+			return nil, cErr
+		}
+		rbdVol.Monitors, rbdVol.ClusterID, err = util.GetMonsAndClusterID(ctx, clusterID, checkClusterIDMapping)
+		if err != nil {
+			log.ErrorLog(ctx, "failed getting mons (%s)", err)
 
-	rbdVol.RadosNamespace, err = util.GetRBDRadosNamespace(util.CsiConfigFile, rbdVol.ClusterID)
-	if err != nil {
-		return nil, err
+			return nil, err
+		}
+		rbdVol.RadosNamespace, err = util.GetRBDRadosNamespace(util.CsiConfigFile, rbdVol.ClusterID)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if rbdVol.Mounter, ok = volOptions["mounter"]; !ok {
 		rbdVol.Mounter = rbdDefaultMounter
@@ -1514,7 +1540,13 @@ func genSnapFromOptions(ctx context.Context, rbdVol *rbdVolume, snapOptions map[
 
 	clusterID, err := util.GetClusterID(snapOptions)
 	if err != nil {
-		return nil, err
+		// v1 VolumeSnapshotClass: no "clusterID" key in parameters — use the source
+		// volume's clusterID (already decoded from volumeHandle by the caller).
+		if _, isV1 := snapOptions[util.ClusterIDsKey]; isV1 {
+			clusterID = rbdVol.ClusterID
+		} else {
+			return nil, err
+		}
 	}
 	rbdSnap.Monitors, rbdSnap.ClusterID, err = util.GetMonsAndClusterID(ctx, clusterID, false)
 	if err != nil {
