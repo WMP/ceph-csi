@@ -533,6 +533,39 @@ func GetNodeStageSecretRefForCluster(options map[string]string, clusterID string
 	return nil, false, nil
 }
 
+// GetControllerExpandSecretRefForCluster returns the ControllerExpandSecretRef
+// for the given clusterID from the v1 clusterIDs format in the options map.
+// NOTE(5177 e2e): restored verbatim from 094a98e46; the merge 20aa8a9dc kept the
+// caller in internal/cephfs/controllerserver.go but dropped this definition.
+func GetControllerExpandSecretRefForCluster(
+	options map[string]string,
+	clusterID string,
+) (*corev1.SecretReference, bool, error) {
+	clusterIDsStr, ok := options[ClusterIDsKey]
+	if !ok || clusterIDsStr == "" {
+		return nil, false, nil
+	}
+
+	entries, isV1, err := parseV1ClusterIDs(clusterIDsStr)
+	if err != nil {
+		return nil, false, err
+	}
+	if !isV1 {
+		return nil, false, nil
+	}
+
+	for _, entry := range entries {
+		if entry.ClusterID == clusterID && entry.ControllerExpandSecretName != "" {
+			return &corev1.SecretReference{
+				Name:      entry.ControllerExpandSecretName,
+				Namespace: entry.ControllerExpandSecretNamespace,
+			}, true, nil
+		}
+	}
+
+	return nil, false, nil
+}
+
 // matchClusterTopology checks if a cluster's TopologyDomainLabels match
 // the given topology segments. All labels defined in the cluster config
 // must be present and match in the topology segments.
